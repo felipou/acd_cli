@@ -20,6 +20,7 @@ from pkg_resources import iter_entry_points
 
 import acdcli
 from acdcli.api import client
+from acdcli.api.encryption import getEncryptedFileSize
 from acdcli.api.common import RequestError, is_valid_id
 from acdcli.cache import format, db
 from acdcli.utils import hashing, progress
@@ -70,6 +71,7 @@ for path in paths:
 def_conf = ConfigParser()
 def_conf['download'] = dict(keep_corrupt=False, keep_incomplete=True)
 def_conf['upload'] = dict(timeout_wait=10)
+def_conf['encryption'] = dict(enabled=False, passphrase="", key_digest="sha1")
 conf = None
 
 # consts
@@ -387,7 +389,8 @@ def overwrite_timeout(initial_node: dict, path: str, hash_: str, size_: int, rsf
     return UL_TIMEOUT
 
 
-def download_complete(node: 'Node', path: str, hash_: str, rsf: bool):
+def download_complete(node: 'Node', path: str, hash_: str, rsf: bool,
+    decrypt=False, decryption_suffix="", node_size=None):
     md5_match = compare_hashes(node.md5, hash_, node.name)
     if md5_match != 0:
         if not conf.getboolean('download', 'keep_corrupt'):
@@ -396,9 +399,18 @@ def download_complete(node: 'Node', path: str, hash_: str, rsf: bool):
             os.rename(path, '%s_%s' % (path, datetime.now().strftime(TIMESTAMP_FORMAT)))
             return md5_match
 
-    size_match = compare_sizes(node.size, os.path.getsize(path), path)
+    if node_size is None:
+        node_size = node.size
+
+    file_size = os.path.getsize(path)
+
+    size_match = compare_sizes(node_size, file_size, path)
+
     if size_match != 0:
         return size_match
+
+    if decrypt and path.endswith(decryption_suffix):
+        os.rename(path, path[:-len(decryption_suffix)])
 
     if rsf:
         try:
@@ -450,7 +462,18 @@ def create_upload_jobs(dirs: list, path: str, parent_id: str, overwr: bool, forc
                 return 0
 
         prog = progress.FileProgress(os.path.getsize(path))
-        fo = partial(upload_file, path, parent_id, overwr, force, dedup, rsf, pg_handler=prog)
+        encrypt = conf.getboolean('encryption', 'enabled')
+        encryption_passphrase = conf.get('encryption', 'passphrase')
+        encryption_key_digest = conf.get('encryption', 'key_digest')
+        encryption_suffix = conf.get('encryption', 'suffix')
+        fo = partial(
+            upload_file, path, parent_id, overwr, force, dedup, rsf,
+            pg_handler=prog,
+            encrypt=encrypt,
+            encryption_passphrase=encryption_passphrase,
+            encryption_key_digest=encryption_key_digest,
+            encryption_suffix=encryption_suffix
+        )
         jobs.append(fo)
         return 0
 
@@ -506,8 +529,14 @@ def traverse_ul_dir(dirs: list, directory: str, parent_id: str, overwr: bool, fo
 
 @retry_on(STD_RETRY_RETVALS)
 def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: bool, rsf: bool,
-                pg_handler: progress.FileProgress = None) -> RetryRetVal:
+                pg_handler: progress.FileProgress = None, encrypt=False,
+                encryption_passphrase="",
+                encryption_key_digest="sha1",
+                encryption_suffix="") -> RetryRetVal:
     short_nm = os.path.basename(path)
+
+    if encrypt:
+        short_nm += encryption_suffix
 
     if dedup and cache.file_size_exists(os.path.getsize(path)):
         nodes = cache.find_by_md5(hashing.hash_file(path))
@@ -538,10 +567,18 @@ def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: boo
         logger.info('Uploading %s' % path)
         hasher = hashing.IncrementalHasher()
         local_size = os.path.getsize(path)
+
+        if encrypt:
+            local_size = getEncryptedFileSize(local_size)
+
         try:
             r = acd_client.upload_file(path, parent_id,
                                        read_callbacks=[hasher.update, pg_handler.update],
-                                       deduplication=dedup)
+                                       deduplication=dedup,
+                                       encrypt=encrypt,
+                                       encryption_passphrase=encryption_passphrase,
+                                       encryption_key_digest=encryption_key_digest,
+                                       encryption_suffix=encryption_suffix)
         except RequestError as e:
             if e.status_code == 409:  # might happen if cache is outdated
                 if not dedup:
@@ -588,7 +625,12 @@ def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: boo
     # ctime is checked because files can be overwritten by files with older mtime
     if rmod < lmod or (rmod < lcre and conflicting_node.size != os.path.getsize(path)) \
             or force:
-        return overwrite(file_id, path, dedup=dedup, rsf=rsf, pg_handler=pg_handler).ret_val
+        return overwrite(
+            file_id, path, dedup=dedup, rsf=rsf, pg_handler=pg_handler,
+            encrypt=encrypt, encryption_passphrase=encryption_passphrase,
+            encryption_key_digest=encryption_key_digest,
+            encryption_suffix=encryption_suffix
+        ).ret_val
     elif not force:
         logger.info('Skipping upload of "%s" because of mtime or ctime and size.' % short_nm)
         pg_handler.done()
@@ -597,9 +639,16 @@ def upload_file(path: str, parent_id: str, overwr: bool, force: bool, dedup: boo
 
 @retry_on(STD_RETRY_RETVALS)
 def overwrite(node_id: str, local_file: str, dedup=False, rsf=False,
-              pg_handler: progress.FileProgress = None) -> RetryRetVal:
+              pg_handler: progress.FileProgress = None,
+              encrypt=False,
+              encryption_passphrase="",
+              encryption_key_digest="sha1",
+              encryption_suffix="") -> RetryRetVal:
     hasher = hashing.IncrementalHasher()
     local_size = os.path.getsize(local_file)
+
+    if encrypt:
+        local_size = getEncryptedFileSize(local_size)
 
     initial_node = acd_client.get_metadata(node_id)
 
@@ -608,7 +657,11 @@ def overwrite(node_id: str, local_file: str, dedup=False, rsf=False,
     try:
         r = acd_client.overwrite_file(node_id, local_file,
                                       read_callbacks=[hasher.update, pg_handler.update],
-                                      deduplication=dedup)
+                                      deduplication=dedup,
+                                      encrypt=encrypt,
+                                      encryption_passphrase=encryption_passphrase,
+                                      encryption_key_digest=encryption_key_digest,
+                                      encryption_suffix=encryption_suffix)
     except RequestError as e:
         if e.status_code == 504 or e.status_code == 408:  # proxy timeout / request timeout
             return overwrite_timeout(initial_node, local_file, hasher.get_result(), local_size, rsf)
@@ -673,9 +726,24 @@ def create_dl_jobs(node_id: str, local_path: str, preserve_mtime: bool, rsf: boo
             return 0
 
     flp = os.path.join(local_path, loc_name)
+
+    decrypt = conf.getboolean('encryption', 'enabled')
+    decryption_suffix = conf.get('encryption', 'suffix')
+
+    if decrypt and flp.endswith(decryption_suffix):
+        flp = flp[:-len(decryption_suffix)]
+    else:
+        decrypt = False
+
     if os.path.isfile(flp):
         logger.info('Skipping download of existing file "%s"' % loc_name)
-        if os.path.getsize(flp) != node.size:
+
+        file_size = os.path.getsize(flp)
+
+        if decrypt:
+            file_size = getEncryptedFileSize(os.path.getsize(flp))
+
+        if file_size != node.size:
             logger.info('Skipped file "%s" has different size than local file.' % loc_name)
             return SIZE_MISMATCH
         return 0
@@ -722,12 +790,21 @@ def download_file(node_id: str, local_path: str, preserve_mtime: bool, rsf: bool
     node = cache.get_node(node_id)
     name, md5, size = node.name, node.md5, node.size
 
+    decrypt = conf.getboolean('encryption', 'enabled')
+    decryption_passphrase = conf.get('encryption', 'passphrase')
+    decryption_key_digest = conf.get('encryption', 'key_digest')
+    decryption_suffix = conf.get('encryption', 'suffix')
+
     logger.info('Downloading "%s".' % name)
 
     hasher = hashing.IncrementalHasher()
     try:
-        acd_client.download_file(node_id, name, local_path, length=size,
-                                 write_callbacks=[hasher.update, pg_handler.update])
+        file_size = acd_client.download_file(node_id, name, local_path, length=size,
+                                 write_callbacks=[hasher.update, pg_handler.update],
+                                 decrypt=decrypt,
+                                 decryption_passphrase=decryption_passphrase,
+                                 decryption_key_digest=decryption_key_digest,
+                                 decryption_suffix=decryption_suffix)
     except RequestError as e:
         logger.error('Downloading "%s" failed. %s' % (name, str(e)))
         return UL_DL_FAILED
@@ -736,7 +813,8 @@ def download_file(node_id: str, local_path: str, preserve_mtime: bool, rsf: bool
             mtime = datetime_to_timestamp(node.modified)
             os.utime(os.path.join(local_path, name), (mtime, mtime))
 
-        return download_complete(node, os.path.join(local_path, name), hasher.get_result(), rsf)
+        return download_complete(node, os.path.join(local_path, name), hasher.get_result(), rsf,
+            decrypt=decrypt, decryption_suffix=decryption_suffix, node_size=file_size)
 
 
 #

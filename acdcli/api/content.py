@@ -8,6 +8,7 @@ import logging
 from urllib.parse import quote_plus
 from requests import Response
 from requests_toolbelt import MultipartEncoder
+from .encryption import TeeBufferedEncryptionReader, BufferedDecryptionWriter
 
 from .common import *
 
@@ -20,7 +21,9 @@ logger = logging.getLogger(__name__)
 class _TeeBufferedReader(object):
     """Proxy buffered reader object that allows callbacks on read operations."""
 
-    def __init__(self, file: io.BufferedReader, callbacks: list = None):
+    def __init__(
+        self, file: io.BufferedReader, callbacks: list = None, **kwargs
+    ):
         self._file = file
         self._callbacks = callbacks
 
@@ -40,10 +43,17 @@ class _TeeBufferedReader(object):
 
 def _tee_open(path: str, **kwargs) -> _TeeBufferedReader:
     f = open(path, 'rb')
-    return _TeeBufferedReader(f, **kwargs)
+
+    if kwargs.get("encrypt", False):
+        return TeeBufferedEncryptionReader(f, **kwargs)
+    else:
+        return _TeeBufferedReader(f, **kwargs)
 
 
-def _get_mimetype(file_name: str = '') -> str:
+def _get_mimetype(file_name: str = '', encrypt=False) -> str:
+    if encrypt:
+        return 'application/octet-stream'
+
     mt = mimetypes.guess_type(file_name)[0]
     return mt if mt else 'application/octet-stream'
 
@@ -114,17 +124,30 @@ class ContentMixin(object):
         return r.json()
 
     def upload_file(self, file_name: str, parent: str = None,
-                    read_callbacks=None, deduplication=False) -> dict:
+                    read_callbacks=None, deduplication=False,
+                    encrypt=False,
+                    encryption_passphrase="",
+                    encryption_key_digest="sha1",
+                    encryption_suffix="") -> dict:
         params = {'suppress': 'deduplication'}
         if deduplication and os.path.getsize(file_name) > 0:
             params = {}
 
         basename = os.path.basename(file_name)
+
+        if encrypt:
+            basename += encryption_suffix
+
+        # print(file_name, basename)
+
         metadata = {'kind': 'FILE', 'name': basename}
         if parent:
             metadata['parents'] = [parent]
-        mime_type = _get_mimetype(basename)
-        f = _tee_open(file_name, callbacks=read_callbacks)
+        mime_type = _get_mimetype(basename, encrypt=encrypt)
+        f = _tee_open(
+            file_name, callbacks=read_callbacks, encrypt=encrypt,
+            encryption_passphrase=encryption_passphrase,
+            encryption_key_digest=encryption_key_digest)
 
         m = MultipartEncoder(fields=OrderedDict([('metadata', json.dumps(metadata)),
                                                  ('content', ('filename', f, mime_type))]))
@@ -191,12 +214,23 @@ class ContentMixin(object):
         return r.json()
 
     def overwrite_file(self, node_id: str, file_name: str,
-                       read_callbacks: list = None, deduplication=False) -> dict:
+                       read_callbacks: list = None, deduplication=False,
+                       encrypt=False,
+                       encryption_passphrase="",
+                       encryption_key_digest="sha1",
+                       encryption_suffix="") -> dict:
         params = {} if deduplication else {'suppress': 'deduplication'}
 
         basename = os.path.basename(file_name)
-        mime_type = _get_mimetype(basename)
-        f = _tee_open(file_name, callbacks=read_callbacks)
+
+        if encrypt:
+            basename += encryption_suffix
+
+        mime_type = _get_mimetype(basename, encrypt=encrypt)
+        f = _tee_open(
+            file_name, callbacks=read_callbacks, encrypt=encrypt,
+            encryption_passphrase=encryption_passphrase,
+            encryption_key_digest=encryption_key_digest)
 
         # basename is ignored
         m = MultipartEncoder(fields={('content', (quote_plus(basename), f, mime_type))})
@@ -252,6 +286,16 @@ class ContentMixin(object):
 
         length = kwargs.get('length', 0)
         resume = kwargs.get('resume', True)
+
+        decrypt = (
+            kwargs.get("decrypt", False) and
+            basename.endswith(kwargs.get("decryption_suffix", ""))
+        )
+
+        # Encrypted files require a little more tought before supporting resume
+        if decrypt:
+            resume = False
+
         if resume and os.path.isfile(part_path):
             with open(part_path, 'ab') as f:
                 part_size = os.path.getsize(part_path)
@@ -273,11 +317,15 @@ class ContentMixin(object):
             f = open(part_path, 'ab')
         else:
             f = open(part_path, 'wb')
+
+            if decrypt:
+                f = BufferedDecryptionWriter(f, file_size=length, **kwargs)
+
         offset = f.tell()
 
         self.chunked_download(node_id, f, offset=offset, **kwargs)
         pos = f.tell()
-        f.close()
+        file_size = f.close()
         if length > 0 and pos < length:
             raise RequestError(RequestError.CODE.INCOMPLETE_RESULT, '[acd_api] download incomplete. '
                                'Expected %i, got %i.' % (length, pos))
@@ -286,6 +334,8 @@ class ContentMixin(object):
             logger.info('Deleting existing file "%s".' % dl_path)
             os.remove(dl_path)
         os.rename(part_path, dl_path)
+
+        return file_size
 
     @catch_conn_exception
     def chunked_download(self, node_id: str, file: io.BufferedWriter, **kwargs):
